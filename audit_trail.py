@@ -87,7 +87,8 @@ def record_decision(transaction_id: str,
 
 
 def record_batch(result_df: object, data_source: str = "CSV upload",
-                 default_action: str = "Flagged for review") -> int:
+                 default_action: str = "Flagged for review",
+                 currency: str = "USD", rate: float = 1.0) -> int:
     """
     Append one audit record for every scored transaction in a result set.
 
@@ -100,6 +101,10 @@ def record_batch(result_df: object, data_source: str = "CSV upload",
         Where the input data came from (e.g. "CSV upload", "Manual entry").
     default_action : str
         Action the system took for each record.
+    currency : str
+        Currency code the user was working in at time of scoring.
+    rate : float
+        Units of `currency` per 1 USD (used to store the local amount).
 
     Returns the number of records appended.
     """
@@ -110,6 +115,7 @@ def record_batch(result_df: object, data_source: str = "CSV upload",
             default_action if int(row.get("is_flagged", 0)) == 1
             else "No action (low risk cleared)"
         )
+        amount_usd = float(row.get("amount", 0.0))
         record_decision(
             transaction_id=tx_id,
             risk_score=float(row.get("fraud_score", 0.0)),
@@ -119,7 +125,9 @@ def record_batch(result_df: object, data_source: str = "CSV upload",
                 "source": data_source,
                 "channel": str(row.get("channel", "")),
                 "tx_type": str(row.get("tx_type", "")),
-                "amount": float(row.get("amount", 0.0)),
+                "currency": currency,
+                "amount": round(amount_usd * rate, 2),
+                "amount_in_usd": round(amount_usd, 2),
             },
             action_taken=action,
         )

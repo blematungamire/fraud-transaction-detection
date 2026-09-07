@@ -27,7 +27,34 @@ from audit_trail import (
     record_decision, record_batch, update_investigator_decision,
     load_audit_log_dataframe, AUDIT_COLUMNS
 )
+from currency import (
+    SUPPORTED_CURRENCIES, RATE_PER_USD, BASE_CURRENCY,
+    to_usd, from_usd, format_amount, currency_options, code_from_option
+)
 from generate_data import generate_transactions
+
+# ---------------------------------------------------------------------------
+# Multi-currency helpers
+# ---------------------------------------------------------------------------
+AMOUNT_COLS = ("amount", "balance_before", "balance_after")
+
+
+def df_to_usd(df: pd.DataFrame, rate: float) -> pd.DataFrame:
+    """Return a copy of df with monetary columns converted to USD."""
+    out = df.copy()
+    for col in AMOUNT_COLS:
+        if col in out.columns:
+            out[col] = out[col].astype(float) / rate
+    return out
+
+
+def df_to_local(df: pd.DataFrame, rate: float) -> pd.DataFrame:
+    """Return a copy of df with monetary columns converted to local currency."""
+    out = df.copy()
+    for col in AMOUNT_COLS:
+        if col in out.columns:
+            out[col] = (out[col].astype(float) * rate).round(2)
+    return out
 
 # ---------------------------------------------------------------------------
 # Page Config
@@ -133,6 +160,27 @@ with st.sidebar:
     )
 
     st.markdown("---")
+    st.subheader("💱 Currency")
+    currency_option = st.selectbox(
+        "Working currency",
+        currency_options(),
+        index=0,
+        help="Amounts you enter or upload are interpreted in this currency. "
+             "They are converted to USD for model scoring and shown back to "
+             "you in this currency."
+    )
+    currency = code_from_option(currency_option)
+    rate = float(RATE_PER_USD.get(currency, 1.0))
+    c_sym = SUPPORTED_CURRENCIES[currency]["symbol"]
+
+    with st.expander("Exchange rates (per 1 USD)"):
+        rate_rows = [f"{k:<5} {v:.4f}" for k, v in RATE_PER_USD.items()]
+        st.text("\n".join(rate_rows))
+        st.caption("Static reference rates. Replace with a live FX API via "
+                   "Streamlit secrets for production.")
+    st.caption(f"Inputs & outputs are shown in **{currency} ({c_sym})**.")
+
+    st.markdown("---")
     st.subheader("📊 Model Status")
     if st.session_state.model_artifacts:
         st.success("Model loaded & ready")
@@ -200,9 +248,10 @@ with tab_upload:
     with col_b:
         if st.button("📥 Download Sample CSV", width="stretch"):
             sample = generate_transactions(200, seed=99)
-            sample.to_csv("sample_transactions.csv", index=False)
+            for col in AMOUNT_COLS:
+                sample[col] = (sample[col].astype(float) * rate).round(2)
             st.download_button(
-                "⬇️ Click to download sample",
+                f"⬇️ Click to download sample ({currency})",
                 data=sample.to_csv(index=False),
                 file_name="sample_transactions.csv",
                 mime="text/csv"
@@ -214,19 +263,24 @@ with tab_upload:
             st.error(f"Missing required columns: {', '.join(missing)}")
         else:
             if st.button("🔍 Run Fraud Detection", type="primary", width="stretch"):
-                with st.spinner("Scoring transactions..."):
-                    results = predict(df_upload, artifacts, threshold=threshold)
-                # Persist every decision to the automated audit trail
-                n_logged = record_batch(results, data_source=f"CSV upload ({uploaded_file.name})")
+                with st.spinner(f"Scoring transactions in {currency}..."):
+                    scored_input = df_to_usd(df_upload, rate)
+                    results = predict(scored_input, artifacts, threshold=threshold,
+                                      currency=currency, symbol=c_sym, usd_per_unit=rate)
+                # Persist every decision to the automated audit trail (USD base)
+                n_logged = record_batch(results, data_source=f"CSV upload ({uploaded_file.name})",
+                                        currency=currency, rate=rate)
+                # Convert results back to the selected currency for display
+                results = df_to_local(results, rate)
                 st.session_state.results_df = results
                 st.success(f"📋 {n_logged} decisions were recorded to the Audit Trail (see Audit Trail tab).")
 
     if st.session_state.results_df is not None:
         results = st.session_state.results_df
         st.markdown("---")
-        st.subheader("Results")
+        st.subheader(f"Results ({currency})")
 
-        n_flagged = results["is_flagged"].sum()
+        n_flagged = int(results["is_flagged"].sum())
         total = len(results)
         fraud_pct = results["fraud_score"].mean()
         total_flagged_amount = results.loc[results["is_flagged"] == 1, "amount"].sum()
@@ -235,7 +289,7 @@ with tab_upload:
         m1.metric("Total Transactions", f"{total:,}")
         m2.metric("Flagged as Fraud", f"{n_flagged:,}", f"{n_flagged/total*100:.1f}%")
         m3.metric("Avg Fraud Score", f"{fraud_pct:.4f}")
-        m4.metric("Flagged Amount", f"${total_flagged_amount:,.2f}")
+        m4.metric("Flagged Amount", f"{format_amount(total_flagged_amount, currency)}")
 
         st.markdown("---")
 
@@ -316,8 +370,8 @@ with tab_upload:
             fig_box = px.box(
                 results, x="is_flagged", y="amount", color="is_flagged",
                 color_discrete_map={0: "#448aff", 1: "#ff1744"},
-                title="Transaction Amount by Flag Status",
-                labels={"is_flagged": "Is Flagged"}
+                title=f"Transaction Amount by Flag Status ({currency})",
+                labels={"is_flagged": "Is Flagged", "amount": f"Amount ({currency})"}
             )
             fig_box.update_layout(height=350, showlegend=False)
             st.plotly_chart(fig_box, width="stretch")
@@ -336,13 +390,13 @@ with tab_upload:
 
 # ===================== TAB 2: MANUAL ENTRY =====================
 with tab_manual:
-    st.subheader("Enter a Single Transaction")
+    st.subheader(f"Enter a Single Transaction ({currency})")
 
     with st.form("manual_entry_form"):
         fc1, fc2, fc3 = st.columns(3)
 
         with fc1:
-            amount = st.number_input("Transaction Amount ($)", min_value=0.01, value=150.0, step=10.0)
+            amount = st.number_input(f"Transaction Amount ({c_sym})", min_value=0.01, value=150.0, step=10.0)
             tx_type = st.selectbox("Transaction Type", ["purchase", "withdrawal", "transfer", "payment"])
             channel = st.selectbox("Channel", ["ATM", "Online", "POS", "Mobile", "Branch"])
 
@@ -358,9 +412,10 @@ with tab_manual:
         with fc3:
             is_international = st.checkbox("International Transaction")
             is_online = st.checkbox("Online Transaction")
-            balance_before = st.number_input("Balance Before ($)", min_value=0.0, value=5000.0, step=100.0)
-            balance_after = st.number_input("Balance After ($)", min_value=-500.0, value=4850.0, step=100.0)
+            balance_before = st.number_input(f"Balance Before ({c_sym})", min_value=0.0, value=5000.0, step=100.0)
+            balance_after = st.number_input(f"Balance After ({c_sym})", min_value=-500.0, value=4850.0, step=100.0)
 
+        st.caption(f"Amounts are entered in {currency} and converted to USD ({BASE_CURRENCY}) for model scoring.")
         submitted = st.form_submit_button("🔍 Score Transaction", type="primary", width="stretch")
 
     if submitted:
@@ -378,7 +433,8 @@ with tab_manual:
             "balance_after": balance_after,
         }])
 
-        result = predict(single_df, artifacts, threshold=threshold)
+        result = predict(df_to_usd(single_df, rate), artifacts, threshold=threshold,
+                         currency=currency, symbol=c_sym, usd_per_unit=rate)
         score = result["fraud_score"].iloc[0]
         flagged = result["is_flagged"].iloc[0]
         risk = result["risk_level"].iloc[0]
@@ -394,14 +450,16 @@ with tab_manual:
                 "source": "Manual entry",
                 "channel": channel,
                 "tx_type": tx_type,
-                "amount": float(amount),
+                "currency": currency,
+                "amount": round(float(amount), 2),
+                "amount_in_usd": round(to_usd(float(amount), currency), 2),
             },
             action_taken=action,
         )
         st.caption("📋 This decision was recorded to the Audit Trail.")
 
         st.markdown("---")
-        st.subheader("Scoring Result")
+        st.subheader(f"Scoring Result ({currency})")
 
         r1, r2, r3 = st.columns(3)
         with r1:
@@ -411,7 +469,7 @@ with tab_manual:
             st.metric("Risk Level", f"{color_map.get(risk, '⚪')} {risk}")
         with r3:
             status = "🚨 FLAGGED" if flagged else "✅ CLEAR"
-            st.metric("Status", status)
+            st.metric("Status", status, delta=f"{currency}")
 
         fig_gauge = go.Figure(go.Indicator(
             mode="gauge+number+delta",
@@ -442,10 +500,10 @@ with tab_manual:
         st.subheader("Feature Explanation")
         single_engineered = engineer_features(single_df)
         feature_vals = {
-            "Amount": f"${amount:,.2f}",
+            "Amount": format_amount(amount, currency),
             "Hour": f"{hour_of_day}:00",
-            "Amount/Balance Ratio": f"{amount / (balance_before + 1):.4f}",
-            "Balance Change": f"${balance_before - balance_after:,.2f}",
+            f"Amount/Balance Ratio ({currency})": f"{amount / (balance_before + 1):.4f}",
+            "Balance Change": format_amount(balance_before - balance_after, currency),
             "International": "Yes" if is_international else "No",
             "Online": "Yes" if is_online else "No",
             "Night Transaction": "Yes" if hour_of_day < 6 or hour_of_day > 22 else "No",
@@ -481,9 +539,10 @@ with tab_analytics:
     if st.button("Generate & Score Test Data", width="stretch"):
         test_df = generate_transactions(n_gen, seed=123)
         with st.spinner("Scoring..."):
-            test_results = predict(test_df, artifacts, threshold=threshold)
-
-        actual_fraud = test_df["is_flagged"].sum() if "is_flagged" in test_df.columns else "N/A"
+            test_results = predict(test_df, artifacts, threshold=threshold,
+                                   currency=currency, symbol=c_sym, usd_per_unit=rate)
+            # Generated data is USD-denominated; localise for display
+            test_results = df_to_local(test_results, rate)
 
         t1, t2, t3, t4 = st.columns(4)
         t1.metric("Total", f"{len(test_results):,}")
@@ -494,7 +553,8 @@ with tab_analytics:
         fig_scatter = px.scatter(
             test_results, x="amount", y="fraud_score",
             color="is_flagged", color_discrete_map={0: "#448aff", 1: "#ff1744"},
-            title="Amount vs Fraud Score",
+            title=f"Amount vs Fraud Score ({currency})",
+            labels={"amount": f"Amount ({currency})"},
             opacity=0.6
         )
         fig_scatter.update_layout(height=400)
@@ -603,9 +663,12 @@ with tab_about:
 
     ### How It Works
     1. **Data Input**: Upload a CSV or enter a transaction manually
-    2. **Feature Engineering**: 12+ derived features from raw transaction attributes
-    3. **Ensemble Scoring**: Three models vote — XGBoost (50%), Random Forest (30%), Isolation Forest (20%)
-    4. **Risk Classification**: Score mapped to CRITICAL / HIGH / MEDIUM / LOW / MINIMAL
+    2. **Currency Normalisation**: Inputs are converted from the sidebar-selected
+       currency to USD (the model's training currency) before scoring
+    3. **Feature Engineering**: 12+ derived features from raw transaction attributes
+    4. **Ensemble Scoring**: Three models vote — XGBoost (50%), Random Forest (30%), Isolation Forest (20%)
+    5. **Risk Classification**: Score mapped to CRITICAL / HIGH / MEDIUM / LOW / MINIMAL
+    6. **Audit Trail**: Every decision is logged with rules, reasoning, and data used
 
     ### Model Details
     | Component | Purpose |

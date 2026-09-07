@@ -13,6 +13,7 @@ Financial fraud costs institutions billions annually. This application provides 
 - **Risk Classification** — CRITICAL / HIGH / MEDIUM / LOW / MINIMAL
 - **Visual Dashboard** — Histograms, box plots, pie charts of results
 - **Adjustable Threshold** — Tune sensitivity via sidebar slider
+- **Multi-Currency** — Set the working currency in the sidebar (16 currencies); inputs are converted to USD for model scoring, results are displayed back in your chosen currency
 - **Export Results** — Download flagged transactions as CSV
 - **Model Analytics** — View feature importance, confusion matrix, ROC-AUC
 - **Automated Audit Trail** — every decision is logged with risk score, rules triggered, AI reasoning, data used, action taken, and space for an investigator's decision and final outcome
@@ -76,21 +77,23 @@ streamlit run app.py
 ### Running Tests
 
 ```bash
-pytest test_app.py -v          # 37 tests: data, model, prediction, edge cases, audit trail
-python test_app_native.py      # 4 functional AppTest checks: render, upload+score, manual entry, audit trail
+pytest test_app.py          # 43 tests: data, model, prediction, edge cases, audit trail, currency
+python test_app_native.py   # 5 functional AppTest checks: render, currency flow, audit trail, upload+score, manual entry
 ```
 
 ## How It Works
 
 1. **Data Input**: User uploads a CSV or enters a single transaction manually.
-2. **Feature Engineering**: 12+ derived features are computed (amount ratios, time flags, balance changes, etc.).
-3. **Ensemble Scoring**: Three models produce independent fraud scores:
+2. **Currency Normalisation**: Input amounts and balances are converted from the sidebar-selected currency (default USD) to USD using static reference rates, since the model is trained on USD-denominated data.
+3. **Feature Engineering**: 12+ derived features are computed (amount ratios, time flags, balance changes, etc.).
+4. **Ensemble Scoring**: Three models produce independent fraud scores:
    - XGBoost (50% weight) — supervised gradient boosting
    - Random Forest (30% weight) — supervised ensemble bagging
    - Isolation Forest (20% weight) — unsupervised anomaly detection
-4. **Threshold Application**: Final ensemble score compared against user-set threshold (default 0.5).
-5. **Risk Classification**: Score mapped to CRITICAL (≥0.8), HIGH (≥0.6), MEDIUM (≥0.4), LOW (≥0.2), MINIMAL (<0.2).
-6. **Audit Trail**: Every decision — from both CSV batch and manual entry — is automatically recorded to `audit_log.csv` with the risk score, business rules triggered, AI reasoning, data used, and the action taken. Investigators review flagged transactions and can record their decision and the final outcome.
+5. **Threshold Application**: Final ensemble score compared against user-set threshold (default 0.5).
+6. **Risk Classification**: Score mapped to CRITICAL (≥0.8), HIGH (≥0.6), MEDIUM (≥0.4), LOW (≥0.2), MINIMAL (<0.2).
+7. **Local Currency Display**: Results (table, metrics, charts) are converted back to the working currency, so the analyst sees familiar numbers while the model scores in USD.
+8. **Audit Trail**: Every decision — from both CSV batch and manual entry — is automatically recorded to `audit_log.csv` with the risk score, business rules triggered, AI reasoning, data used (including original currency and USD equivalent), and the action taken. Investigators review flagged transactions and can record their decision and the final outcome.
 
 ### Audit Trail Columns
 

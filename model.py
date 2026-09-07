@@ -22,6 +22,9 @@ CATEGORICAL_COLS = ["tx_type", "channel", "day_of_week", "merchant_category"]
 NUMERICAL_COLS = ["amount", "hour_of_day", "balance_before", "balance_after"]
 BOOLEAN_COLS = ["is_international", "is_online"]
 
+BASE_CURRENCY = "USD"
+HIGH_VALUE_THRESHOLD_USD = 5000.0
+
 
 def engineer_features(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -180,22 +183,34 @@ def load_model(path: str = None) -> Dict[str, Any]:
 
 
 def predict(df: pd.DataFrame, artifacts: Dict[str, Any],
-            threshold: float = 0.5) -> pd.DataFrame:
+            threshold: float = 0.5,
+            currency: str = "USD",
+            symbol: str = "$",
+            usd_per_unit: float = 1.0) -> pd.DataFrame:
     """
     Score transactions for fraud probability and flag suspicious ones.
 
     Parameters
     ----------
     df : pd.DataFrame
-        Raw transaction data (without 'is_fraud' column).
+        Raw transaction data (without 'is_fraud' column). Amounts and balances
+        must already be normalized to USD (the model's training currency).
     artifacts : dict
         Trained model artifacts from train_model().
     threshold : float
         Probability threshold for flagging fraud (0.0 - 1.0).
+    currency : str
+        Currency code used for display/audit labelling (e.g. "INR").
+    symbol : str
+        Currency symbol used in the generated rule / reasoning text.
+    usd_per_unit : float
+        Exchange rate (units of `currency` per 1 USD) used to localise the
+        "high value" threshold wording.
 
     Returns
     -------
-    pd.DataFrame with original data plus fraud_score and is_flagged columns.
+    pd.DataFrame with original data plus fraud_score, is_flagged, risk_level,
+    currency, rules_triggered and ai_reasoning columns.
     """
     df = df.copy()
     X, _, _ = prepare_data(df, fit_encoders=False, encoders=artifacts["encoders"])
@@ -212,26 +227,35 @@ def predict(df: pd.DataFrame, artifacts: Dict[str, Any],
     df["fraud_score"] = np.round(ensemble_prob, 4)
     df["is_flagged"] = (ensemble_prob >= threshold).astype(int)
     df["risk_level"] = df["fraud_score"].apply(_risk_level)
+    df["currency"] = currency
 
-    # Populate explainability: rules triggered and AI reasoning for the audit trail
+    # Populate explainability: rules triggered and AI reasoning for the audit trail.
+    # Logic always uses USD-normalised amounts; wording uses the local currency.
+    local_high_threshold = HIGH_VALUE_THRESHOLD_USD * usd_per_unit
     eng = engineer_features(df)
     df["rules_triggered"] = [
-        _rules_triggered(row, eng) for _, row in eng.iterrows()
+        _rules_triggered(row, local_high_threshold, symbol)
+        for _, row in eng.iterrows()
     ]
     df["ai_reasoning"] = [
-        _ai_reasoning(row, score)
+        _ai_reasoning(row, score, local_high_threshold, symbol, usd_per_unit)
         for row, score in zip(eng.itertuples(index=False), df["fraud_score"])
     ]
 
     return df
 
 
-def _rules_triggered(row, eng) -> str:
-    """Return a human-readable list of business rules that fired for a row."""
+def _rules_triggered(row, local_high_threshold: float = HIGH_VALUE_THRESHOLD_USD,
+                     symbol: str = "$") -> str:
+    """Return a human-readable list of business rules that fired for a row.
+
+    `row` carries amounts in USD. The comparison threshold is therefore fixed
+    in USD; `local_high_threshold` and `symbol` only shape the wording.
+    """
     rules = []
 
-    if row.amount >= 5000:
-        rules.append("High-value transaction (> $5,000)")
+    if row.amount >= HIGH_VALUE_THRESHOLD_USD:
+        rules.append(f"High-value transaction ({symbol}{local_high_threshold:,.0f})")
     if row.amount_to_balance_ratio >= 1.5:
         rules.append("Amount exceeds 150% of available balance")
     if row.is_night:
@@ -250,8 +274,14 @@ def _rules_triggered(row, eng) -> str:
     return "; ".join(rules) if rules else "No high-risk rules triggered"
 
 
-def _ai_reasoning(row, score: float) -> str:
-    """Build a plain-English explanation for a transaction's fraud score."""
+def _ai_reasoning(row, score: float,
+                  local_high_threshold: float = HIGH_VALUE_THRESHOLD_USD,
+                  symbol: str = "$", usd_per_unit: float = 1.0) -> str:
+    """Build a plain-English explanation for a transaction's fraud score.
+
+    `row` carries amounts in USD. Wording (amount values and currency symbols)
+    is localised via `usd_per_unit` and `symbol`.
+    """
     if score >= 0.8:
         base = "Model strongly flags this transaction"
     elif score >= 0.6:
@@ -262,8 +292,9 @@ def _ai_reasoning(row, score: float) -> str:
         base = "Model finds this transaction low risk"
 
     reasons = []
-    if row.amount >= 5000:
-        reasons.append(f"large amount (${row.amount:,.0f})")
+    local_amount = row.amount * usd_per_unit
+    if row.amount >= HIGH_VALUE_THRESHOLD_USD:
+        reasons.append(f"large amount ({symbol}{local_amount:,.0f})")
     if row.amount_to_balance_ratio >= 1.5:
         reasons.append("amount far exceeds balance")
     if row.is_night:

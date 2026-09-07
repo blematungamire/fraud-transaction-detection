@@ -454,10 +454,72 @@ class TestAuditTrail:
             "is_online": 1, "balance_before": 1000, "balance_after": -4000,
         }]))
         row = eng.iloc[0]
-        rules = _rules_triggered(row, eng)
+        rules = _rules_triggered(row)
         assert "High-value" in rules
         assert "night" in rules.lower() or "Night" in rules
         assert "Online + international" in rules
+
+
+# ---------------------------------------------------------------------------
+# Test: Multi-currency System
+# ---------------------------------------------------------------------------
+from currency import RATE_PER_USD as RATE_TO_USD
+
+
+class TestCurrency:
+    def test_roundtrip_usd(self):
+        from currency import to_usd, from_usd
+        for code, r in RATE_TO_USD.items():
+            amt = 100.0
+            assert abs(from_usd(to_usd(amt, code), code) - amt) < 1e-6
+
+    def test_convert_between_currencies(self):
+        from currency import convert
+        # 100 EUR -> GBP should be positive and reasonable
+        gbp = convert(100, "EUR", "GBP")
+        assert 50 < gbp < 150
+
+    def test_high_value_threshold_localised(self):
+        from currency import high_value_threshold
+        from currency import RATE_PER_USD
+        assert high_value_threshold("INR") == 5000.0 * RATE_PER_USD["INR"]
+        assert high_value_threshold("USD") == 5000.0
+
+    def test_predict_currency_labelling(self, trained_artifacts):
+        """predict() with a non-USD currency records currency + localised text."""
+        tx = pd.DataFrame([{
+            "transaction_id": "CCY_001",
+            "amount": 9000.0, "tx_type": "transfer", "channel": "Online",
+            "hour_of_day": 3, "day_of_week": "Sat",
+            "merchant_category": "jewelry", "is_international": 1,
+            "is_online": 1, "balance_before": 1000.0, "balance_after": -8000.0,
+        }])
+        rate = RATE_TO_USD["INR"]
+        result = predict(tx, trained_artifacts, currency="INR", symbol="₹", usd_per_unit=rate)
+        assert result["currency"].iloc[0] == "INR"
+        reasoning = result["ai_reasoning"].iloc[0]
+        rules = result["rules_triggered"].iloc[0]
+        assert "High-value transaction (₹" in rules
+        assert "₹" in reasoning
+
+    def test_format_amount_decimals(self):
+        from currency import format_amount
+        assert format_amount(149.5, "USD") == "$149.50"
+        assert format_amount(15000, "JPY") == "¥15,000"
+
+    def test_batch_currency_metadata_in_audit(self):
+        reset_audit_log()
+        df = pd.DataFrame([
+            {"transaction_id": "CCY_A", "amount": 120.0, "channel": "POS",
+             "tx_type": "purchase", "fraud_score": 0.1, "is_flagged": 0,
+             "rules_triggered": "none", "ai_reasoning": "low risk"},
+        ])
+        record_batch(df, data_source="CSV upload", currency="GBP", rate=0.79)
+        rec = load_audit_log()[0]
+        import json
+        used = json.loads(rec["data_used"])
+        assert used["currency"] == "GBP"
+        assert abs(used["amount"] - 94.8) < 0.01  # 120 USD * 0.79 GBP/USD
 
 
 if __name__ == "__main__":

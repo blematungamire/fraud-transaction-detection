@@ -25,6 +25,47 @@ def test_app_renders():
     assert any("Audit Trail" in str(t.label) for t in at.tabs)
 
 
+def test_currency_selection_flow():
+    reset_audit_log()
+
+    at = AppTest.from_file(APP_PATH, default_timeout=120)
+    at.run()
+    assert not at.exception
+
+    # Select INR in the sidebar currency selector
+    assert at.sidebar.selectbox, "expected at least one sidebar selectbox"
+    currency_box = None
+    for sb in at.sidebar.selectbox:
+        if "Working currency" in str(sb.label):
+            currency_box = sb
+            break
+    assert currency_box is not None, "currency selectbox not found"
+    currency_box.select("INR — Indian Rupee")
+    at.run()
+    assert not at.exception, f"App raised after currency change: {at.exception}"
+
+    with open(SAMPLE_CSV, "rb") as f:
+        content = f.read()
+    at.file_uploader[0].set_value(
+        [(os.path.basename(SAMPLE_CSV), content, "text/csv")]
+    )
+    at.run()
+    for btn in at.button:
+        if "Run Fraud Detection" in str(btn.label):
+            btn.click()
+            break
+    at.run()
+    assert not at.exception, f"App raised after INR scoring: {at.exception}"
+
+    # Audit records should carry INR metadata
+    log = load_audit_log()
+    assert len(log) > 0
+    import json
+    used = json.loads(log[0]["data_used"])
+    assert used["currency"] == "INR"
+    print(f"Currency flow wrote {len(log)} INR decisions OK")
+
+
 def test_audit_trail_writes_on_scoring():
     reset_audit_log()
     assert len(load_audit_log()) == 0
