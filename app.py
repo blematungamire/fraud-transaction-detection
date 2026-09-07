@@ -23,6 +23,10 @@ from model import (
     train_model, save_model, load_model, predict,
     get_feature_importance, MODEL_DIR, engineer_features, validate_csv
 )
+from audit_trail import (
+    record_decision, record_batch, update_investigator_decision,
+    load_audit_log_dataframe, AUDIT_COLUMNS
+)
 from generate_data import generate_transactions
 
 # ---------------------------------------------------------------------------
@@ -165,8 +169,8 @@ artifacts = st.session_state.model_artifacts
 # ---------------------------------------------------------------------------
 # Tabs
 # ---------------------------------------------------------------------------
-tab_upload, tab_manual, tab_analytics, tab_about = st.tabs(
-    ["📁 Upload CSV", "✏️ Manual Entry", "📈 Analytics Dashboard", "ℹ️ About"]
+tab_upload, tab_manual, tab_analytics, tab_audit, tab_about = st.tabs(
+    ["📁 Upload CSV", "✏️ Manual Entry", "📈 Analytics Dashboard", "📋 Audit Trail", "ℹ️ About"]
 )
 
 # ===================== TAB 1: FILE UPLOAD =====================
@@ -212,7 +216,10 @@ with tab_upload:
             if st.button("🔍 Run Fraud Detection", type="primary", width="stretch"):
                 with st.spinner("Scoring transactions..."):
                     results = predict(df_upload, artifacts, threshold=threshold)
+                # Persist every decision to the automated audit trail
+                n_logged = record_batch(results, data_source=f"CSV upload ({uploaded_file.name})")
                 st.session_state.results_df = results
+                st.success(f"📋 {n_logged} decisions were recorded to the Audit Trail (see Audit Trail tab).")
 
     if st.session_state.results_df is not None:
         results = st.session_state.results_df
@@ -376,6 +383,23 @@ with tab_manual:
         flagged = result["is_flagged"].iloc[0]
         risk = result["risk_level"].iloc[0]
 
+        # Persist this decision to the automated audit trail
+        action = "Flagged for review" if flagged else "No action (low risk cleared)"
+        record_decision(
+            transaction_id="MANUAL_001",
+            risk_score=float(score),
+            rules_triggered=str(result["rules_triggered"].iloc[0]),
+            ai_reasoning=str(result["ai_reasoning"].iloc[0]),
+            data_used={
+                "source": "Manual entry",
+                "channel": channel,
+                "tx_type": tx_type,
+                "amount": float(amount),
+            },
+            action_taken=action,
+        )
+        st.caption("📋 This decision was recorded to the Audit Trail.")
+
         st.markdown("---")
         st.subheader("Scoring Result")
 
@@ -477,7 +501,97 @@ with tab_analytics:
         st.plotly_chart(fig_scatter, width="stretch")
 
 
-# ===================== TAB 4: ABOUT =====================
+# ===================== TAB 4: AUDIT TRAIL =====================
+with tab_audit:
+    st.subheader("📋 Automated Audit Trail")
+    st.markdown(
+        "Every decision made by the fraud-detection system is recorded here — "
+        "append-only, timestamped, and fully traceable."
+    )
+
+    audit_df = load_audit_log_dataframe()
+
+    col_stats = st.columns(4)
+    with col_stats[0]:
+        st.metric("Total Decisions Logged", f"{len(audit_df):,}")
+    with col_stats[1]:
+        flagged_count = len(audit_df[audit_df["action_taken"].str.startswith("Flagged", na=False)]) if len(audit_df) else 0
+        st.metric("Flagged Actions", f"{flagged_count:,}")
+    with col_stats[2]:
+        pending = len(audit_df[audit_df["investigator_decision"].eq("Pending review")]) if len(audit_df) else 0
+        st.metric("Awaiting Review", f"{pending:,}")
+    with col_stats[3]:
+        critical = len(audit_df[audit_df["risk_score"].astype(float) >= 0.8]) if len(audit_df) else 0
+        st.metric("Critical (score ≥ 0.8)", f"{critical:,}")
+
+    st.markdown("---")
+
+    if audit_df.empty:
+        st.info("No decisions recorded yet. Run a prediction from the Upload or Manual Entry tabs.")
+    else:
+        st.markdown("### Full Audit Trail")
+        st.dataframe(
+            audit_df[AUDIT_COLUMNS],
+            width="stretch", height=350, hide_index=True
+        )
+
+        st.download_button(
+            "⬇️ Download Audit Trail (CSV)",
+            data=audit_df[AUDIT_COLUMNS].to_csv(index=False),
+            file_name="audit_trail.csv",
+            mime="text/csv",
+            width="stretch"
+        )
+
+        st.markdown("---")
+        st.markdown("### Investigator Review")
+        st.markdown("Update the human decision and final outcome for a logged transaction.")
+
+        tx_options = [""] + sorted(audit_df["transaction_id"].unique().tolist())
+        selected_tx = st.selectbox("Select Transaction ID", tx_options, key="audit_tx_select")
+
+        if selected_tx:
+            row = audit_df[audit_df["transaction_id"] == selected_tx].iloc[-1]
+            st.markdown(f"""
+            **Details for {selected_tx}**
+            - Risk score: `{row['risk_score']}`
+            - Risk level: {row['action_taken']}
+            - AI reasoning: {row['ai_reasoning']}
+            - Rules triggered: {row['rules_triggered']}
+            """)
+
+            with st.form("investigator_form"):
+                c1, c2 = st.columns(2)
+                with c1:
+                    decision = st.selectbox(
+                        "Investigator Decision",
+                        ["Confirmed fraudulent", "Confirmed legitimate",
+                         "Escalated to senior review", "Requires more data", "Pending review"],
+                        index=4
+                    )
+                with c2:
+                    outcome = st.selectbox(
+                        "Final Outcome",
+                        ["Awaiting investigator", "Fraud — account suspended",
+                         "Fraud — refund issued", "False positive — cleared",
+                         "Monitoring account"],
+                        index=0
+                    )
+                submitted_review = st.form_submit_button("✔️ Update Decision", type="primary", width="stretch")
+
+            if submitted_review:
+                ok = update_investigator_decision(selected_tx, decision, outcome)
+                if ok:
+                    st.success(f"Decision updated for {selected_tx}.")
+                    st.rerun()
+                else:
+                    st.error(f"Transaction {selected_tx} not found in audit log.")
+
+    st.markdown("---")
+    st.caption("Audit log stored in `audit_log.csv` in the project directory.")
+
+
+# ===================== TAB 5: ABOUT =====================
 with tab_about:
     st.subheader("About This Application")
 

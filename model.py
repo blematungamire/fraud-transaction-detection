@@ -213,7 +213,74 @@ def predict(df: pd.DataFrame, artifacts: Dict[str, Any],
     df["is_flagged"] = (ensemble_prob >= threshold).astype(int)
     df["risk_level"] = df["fraud_score"].apply(_risk_level)
 
+    # Populate explainability: rules triggered and AI reasoning for the audit trail
+    eng = engineer_features(df)
+    df["rules_triggered"] = [
+        _rules_triggered(row, eng) for _, row in eng.iterrows()
+    ]
+    df["ai_reasoning"] = [
+        _ai_reasoning(row, score)
+        for row, score in zip(eng.itertuples(index=False), df["fraud_score"])
+    ]
+
     return df
+
+
+def _rules_triggered(row, eng) -> str:
+    """Return a human-readable list of business rules that fired for a row."""
+    rules = []
+
+    if row.amount >= 5000:
+        rules.append("High-value transaction (> $5,000)")
+    if row.amount_to_balance_ratio >= 1.5:
+        rules.append("Amount exceeds 150% of available balance")
+    if row.is_night:
+        rules.append("Unusual hour (night, outside 06:00-22:00)")
+    if row.is_weekend:
+        rules.append("Weekend transaction")
+    if row.is_online and row.is_international:
+        rules.append("Online + international (typical fraud vector)")
+    if row.balance_after < 0:
+        rules.append("Transaction drove balance negative")
+    if row.hour_of_day in (0, 1, 2, 3, 4, 5, 22, 23) and row.is_online:
+        rules.append("Late-night online purchase")
+    if row.amount >= 1000 and row.tx_type == "transfer":
+        rules.append("Large transfer")
+
+    return "; ".join(rules) if rules else "No high-risk rules triggered"
+
+
+def _ai_reasoning(row, score: float) -> str:
+    """Build a plain-English explanation for a transaction's fraud score."""
+    if score >= 0.8:
+        base = "Model strongly flags this transaction"
+    elif score >= 0.6:
+        base = "Model indicates elevated fraud risk"
+    elif score >= 0.4:
+        base = "Model shows moderate risk; review advised"
+    else:
+        base = "Model finds this transaction low risk"
+
+    reasons = []
+    if row.amount >= 5000:
+        reasons.append(f"large amount (${row.amount:,.0f})")
+    if row.amount_to_balance_ratio >= 1.5:
+        reasons.append("amount far exceeds balance")
+    if row.is_night:
+        reasons.append("occurred at night")
+    if row.is_online and row.is_international:
+        reasons.append("online and international")
+    if row.balance_after < 0:
+        reasons.append("left balance negative")
+    if row.is_weekend:
+        reasons.append("weekend timing")
+
+    if reasons:
+        base += " due to " + ", ".join(reasons)
+    else:
+        base += " with no strong anomaly indicators"
+
+    return base + f" (score {score:.3f})"
 
 
 def _risk_level(score: float) -> str:

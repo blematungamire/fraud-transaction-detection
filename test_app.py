@@ -13,6 +13,10 @@ import numpy as np
 sys.path.insert(0, os.path.dirname(__file__))
 
 from generate_data import generate_transactions
+from audit_trail import (
+    record_decision, record_batch, update_investigator_decision,
+    load_audit_log, load_audit_log_dataframe, reset_audit_log, AUDIT_COLUMNS
+)
 from model import (
     train_model, predict, engineer_features,
     prepare_data, save_model, load_model, get_feature_importance,
@@ -354,6 +358,106 @@ class TestCSVValidation:
         missing = validate_csv(df)
         assert len(missing) > 0
         assert "channel" in missing
+
+
+# ---------------------------------------------------------------------------
+# Test: Automated Audit Trail
+# ---------------------------------------------------------------------------
+class TestAuditTrail:
+
+    def _write_defaults(self):
+        # ensure the log starts clean for isolated tests
+        reset_audit_log()
+
+    def test_records_required_columns(self):
+        reset_audit_log()
+        rec = record_decision(
+            transaction_id="AUD_001", risk_score=0.87,
+            rules_triggered="High-value transaction (> $5,000)",
+            ai_reasoning="flagged due to large amount",
+            data_used={"source": "test", "amount": 9000},
+            action_taken="Flagged for review",
+        )
+        for col in AUDIT_COLUMNS:
+            assert col in rec, f"missing column {col}"
+        assert rec["transaction_id"] == "AUD_001"
+        assert rec["investigator_decision"] == "Pending review"
+        assert rec["final_outcome"] == "Awaiting investigator"
+
+    def test_appends_new_records_not_overwrites(self):
+        reset_audit_log()
+        record_decision(transaction_id="R1", risk_score=0.1,
+                        rules_triggered="", ai_reasoning="",
+                        data_used={}, action_taken="No action")
+        record_decision(transaction_id="R2", risk_score=0.9,
+                        rules_triggered="", ai_reasoning="",
+                        data_used={}, action_taken="Flagged for review")
+        log = load_audit_log()
+        assert len(log) == 2
+
+    def test_record_batch_creates_one_row_per_transaction(self):
+        reset_audit_log()
+        df = pd.DataFrame([
+            {"transaction_id": "T1", "amount": 100, "channel": "POS",
+             "tx_type": "purchase", "fraud_score": 0.1, "is_flagged": 0,
+             "rules_triggered": "none", "ai_reasoning": "low risk"},
+            {"transaction_id": "T2", "amount": 9000, "channel": "Online",
+             "tx_type": "transfer", "fraud_score": 0.92, "is_flagged": 1,
+             "rules_triggered": "High-value", "ai_reasoning": "large amount"},
+        ])
+        count = record_batch(df, data_source="CSV upload")
+        assert count == 2
+        log = load_audit_log()
+        assert len(log) == 2
+        assert log[1]["transaction_id"] == "T2"
+        assert log[1]["action_taken"].startswith("Flagged")
+        assert log[0]["action_taken"].startswith("No action")
+
+    def test_update_investigator_decision(self):
+        reset_audit_log()
+        record_decision(transaction_id="AUD_003", risk_score=0.85,
+                        rules_triggered="x", ai_reasoning="y",
+                        data_used={}, action_taken="Flagged for review")
+        ok = update_investigator_decision(
+            "AUD_003", "Confirmed fraudulent", "Fraud — account suspended")
+        assert ok is True
+        log = load_audit_log()
+        assert log[0]["investigator_decision"] == "Confirmed fraudulent"
+        assert log[0]["final_outcome"] == "Fraud — account suspended"
+
+    def test_update_missing_transaction_returns_false(self):
+        reset_audit_log()
+        ok = update_investigator_decision("NOPE", "Confirmed legitimate")
+        assert ok is False
+
+    def test_predict_output_feeds_audit_trail(self, trained_artifacts):
+        """predict() must expose rules_triggered and ai_reasoning for auditing."""
+        tx = pd.DataFrame([{
+            "transaction_id": "AUD_TX_1",
+            "amount": 9999.99, "tx_type": "transfer", "channel": "Online",
+            "hour_of_day": 3, "day_of_week": "Sun",
+            "merchant_category": "jewelry", "is_international": 1,
+            "is_online": 1, "balance_before": 500.0, "balance_after": -9000.0,
+        }])
+        result = predict(tx, trained_artifacts)
+        assert "rules_triggered" in result.columns
+        assert "ai_reasoning" in result.columns
+        assert result["rules_triggered"].iloc[0] != ""
+        assert result["ai_reasoning"].iloc[0] != ""
+
+    def test_round_amount_and_night_rules(self):
+        from model import _rules_triggered
+        eng = engineer_features(pd.DataFrame([{
+            "amount": 5000, "tx_type": "purchase", "channel": "Online",
+            "hour_of_day": 2, "day_of_week": "Sat",
+            "merchant_category": "electronics", "is_international": 1,
+            "is_online": 1, "balance_before": 1000, "balance_after": -4000,
+        }]))
+        row = eng.iloc[0]
+        rules = _rules_triggered(row, eng)
+        assert "High-value" in rules
+        assert "night" in rules.lower() or "Night" in rules
+        assert "Online + international" in rules
 
 
 if __name__ == "__main__":
